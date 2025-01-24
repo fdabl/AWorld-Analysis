@@ -1,0 +1,1813 @@
+---
+title: "AWorld Data Analysis"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: Fabian Dablander
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, eval = TRUE,
+  fig.align = 'center', fig.width = 8, fig.height = 6, dpi = 300,
+  out.width='100%', out.height='100%'
+)
+```
+
+# Setup
+This document includes the statistical analyses reported in the paper Dablander, F., Nielsen, K.S., Bauer, J.M., Basconi, L., & Brick, C. ([2025](https://osf.io/preprints/psyarxiv/4dx8q)). Personal climate actions in a popular smartphone app. We cannot share the data itself for privacy reasons.
+
+```{r}
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(scales)
+library(stringr)
+library(ggplot2)
+library(ggExtra)
+library(lubridate)
+library(gridExtra)
+library(BayesFactor)
+library(RColorBrewer)
+source('helpers.R')
+
+df_act_all <- read.csv('actions_log.csv') %>% 
+  rename(
+    created_at = createdAt,
+    category = categoryId,
+    co2 = co2Saving,
+    energy = energySaving,
+    water = waterSaving
+  ) %>% 
+  mutate(
+    category = ifelse(action_name == 'Take the train instead of the plane', 'Mobility', category)
+  )
+
+# Some rows are duplicated (same action logged twice at exactly the same time)
+# This is because they can be associated with multiple SDGs in the app
+# For our purposes, we drop those duplicate entries
+df_count <- df_act_all %>% 
+  group_by(user_id, created_at, action_name) %>% 
+  summarize(n = n())
+
+# Dropping the duplicate entries drops about 55% of all rows
+df_act <- df_act_all %>% distinct(created_at, user_id, action_name, .keep_all = TRUE)
+
+# We do the same for users, which drops about 0.5% of rows
+df_users <- read.csv('users.csv') %>%
+  distinct(sub, .keep_all = TRUE) %>% 
+  filter(integration == '') # only take those which use the app organically (not through their company)
+```
+
+We remove the mobility tracking items.
+
+```{r}
+# These are mobility tracking items that we wish to remove
+mobility_tracking_ids <- c(
+  'a53c7621-c9f6-4d56-a4ba-ce3d41a81858',
+  'd77d901c-4597-4768-b6c3-7896b35aa90d',
+  '01d9a039-8541-482c-a495-bcc8ebc3722f',
+  '512698e9-5b22-44c1-9b83-91f30301a702',
+  'b0bfff3b-a48f-4184-9a11-33eae5b9a7f9'
+)
+
+# Merge habits_info with when the habit was created below
+df_act_time <- read.csv('action_data.csv')
+
+# Had two habit names 'Choose bulk products', with ids
+# 3ace6230-553d-4088-b6d5-349c58808ba1 and 6ca11dcf-5a4b-4dc6-b4aa-74eb98fd8283
+# So I dropped duplicates
+habits_info <- read.csv('action_details.csv', sep = ';') %>% 
+  rename(
+    habit_id = id,
+    habit_name = handle
+  ) %>% 
+  distinct(habit_name, .keep_all = TRUE) %>% 
+  left_join(
+    df_act_time %>% rename(habit_id = action_id) %>% select(habit_id, created_at),
+    by = 'habit_id'
+  ) %>% 
+  mutate(created_at = as_date(created_at))
+
+mobility_tracking_names <- (habits_info %>% filter(habit_id %in% mobility_tracking_ids))$habit_name
+
+df_act <- df_act %>% 
+  rename(
+    sub = user_id,
+    logged_habit = created_at,
+    habit_name = action_name
+  ) %>% 
+  mutate(logged_habit = as.Date(logged_habit)) %>% 
+  filter(
+    sub %in% df_users$sub, # Only include organic users [reduces to 27,167]
+    !(actionId %in% mobility_tracking_ids) # Only include non-mobility-tracked actions [reduces to 26,106]
+  )
+
+# Note that this right-pads the observations to end on the last week any user logged behaviour ('2024-09-09')
+df_action_weekly <- weeklyrize(df_act, end_date = as.Date(max(df_act$logged_habit)))
+```
+
+We summarize the activity of users into one table.
+
+```{r}
+# Compute an activity table
+activity_table <- df_action_weekly %>% 
+  mutate(logged_habit = as.Date(logged_habit)) %>% 
+  group_by(sub) %>% 
+  summarize(
+    nr_act = sum(!is.na(logged_habit)),
+    first_habit = min(logged_habit),
+    last_habit = max(logged_habit),
+    co2 = sum(co2, na.rm = TRUE),
+    energy = sum(energy, na.rm = TRUE),
+    water = sum(water, na.rm = TRUE)
+  ) %>% 
+  arrange(desc(nr_act)) %>% 
+  left_join(
+    df_users %>% select(sub, created_at, country), by = 'sub'
+  ) %>% 
+  rename(
+    join_date = created_at
+  ) %>% 
+  mutate(
+    join_date = as.Date(join_date),
+    last_habit = as.Date(last_habit),
+    time_span_on_app = as.numeric(last_habit - join_date),
+    time_span_active = as.numeric(last_habit - first_habit),
+    nr_act_daily = round(nr_act /time_span_active)
+  ) %>% 
+  select(
+    sub, country, nr_act, nr_act_daily, co2,
+    energy, water, last_habit, join_date,
+    time_span_on_app, time_span_active
+  )
+```
+
+```{r}
+# Remove the weeks where there is no habit (NA); introduced above by weeklyrizing
+df_violations <- get_violations_dfs(df_action_weekly %>% filter(!is.na(habit_name)), habits_info)
+df_violations_agg <- df_violations$df_agg
+
+# We extend the activity table with the violations information
+activity_table_ext <- activity_table %>% 
+  left_join(
+    df_violations_agg %>%
+      group_by(sub) %>% 
+      summarize(
+        nr_distinct_violations = sum(violations_sum > 0),
+        prop_violations = nr_distinct_violations / nrow(habits_info),
+        perc_when_violated = mean(violations_prop[which(violations_sum > 0)])
+      ), by = 'sub'
+  ) %>% 
+  rename(n = nr_act)
+```
+
+Here we remove users that have to little app activity and violate behavioural thresholds (see paper for details).
+
+```{r}
+# Main analysis
+df_clean <- get_cleaned_df(df_action_weekly, activity_table_ext, cutoffs = c(1, 3, 3))$df_clean
+
+# # Sensitivity: Relaxed restrictions
+# df_clean <- get_cleaned_df(df_action_weekly, activity_table_ext, cutoffs = c(1, 2, 4))$df_clean
+# 
+# # Sensitivity: Stringent restrictions
+# df_clean <- get_cleaned_df(df_action_weekly, activity_table_ext, cutoffs = c(1, 4, 2))$df_clean
+
+df_clean <- df_clean %>% rename(nr_act = n) # for clarity
+```
+
+```{r}
+length(unique(df_clean$sub))
+```
+
+We create a cleaned and filtered action file.
+
+```{r}
+df_act_clean <- df_act %>% 
+  filter(sub %in% unique(df_clean$sub)) %>%
+  left_join(
+    select(habits_info, habit_name), by = 'habit_name'
+   ) %>% 
+  left_join(
+    select(df_users, sub, country, integration), by = 'sub'
+  )
+  
+nrow(df_act_clean)
+```
+
+# Main analyses
+Below is the code to reproduce all figures in the main text of the manuscript.
+
+## Figure 2: Action patterns over time
+We dailyrize the data.
+
+```{r}
+df_seq <- dailyrize(df_act_clean, habits_info) %>% 
+  arrange(sub, habit_name)
+```
+
+Get action sequences of 20 random users.
+
+```{r}
+set.seed(1)
+users <- sample(unique(df_act_clean$sub), size = 20)
+psequences <- plot_habit_seq_many(df_seq, users)
+```
+
+We calculate segment size, average gap, and dice similarity.
+
+```{r}
+# Now aggregate over weeks
+df_weekly <- df_seq %>% 
+  mutate(
+    year = year(day),
+    week = week(day)
+  ) %>% 
+  group_by(sub, habit_name, year, week) %>% 
+  summarize(week_count = sum(value))
+
+df_prep <- df_seq %>%
+  group_by(sub, habit_name) %>% 
+  mutate(time = seq(n()))
+
+df_wide <- df_prep %>%
+  pivot_wider(names_from = habit_name, values_from = value, values_fill = 0) %>%
+  dplyr::select(-day)
+
+habit_names <- colnames(df_wide)[-seq(2)]
+colnames(df_wide) <- c('sub', 'time', paste0('habit', seq(length(habit_names))))
+
+process_group <- function(data, filter_d = TRUE) {
+  data <- data %>%
+    mutate(all_habits_zero = rowSums(select(., starts_with('habit'))) == 0) %>%
+    filter(!all_habits_zero) %>%
+    mutate(
+        prev_diff = time - lag(time, default = time[1]),
+        next_diff = lead(time, default = time[length(time)]) - time
+    )
+  
+  if (filter_d) {
+    data <- data %>% 
+    filter(prev_diff == 1 | next_diff == 1) %>%
+    select(-prev_diff, -next_diff, -all_habits_zero)
+  }
+  
+  data
+}
+
+# Remove rows with all 0 entries
+df_filtered <- df_wide %>% 
+  group_by(sub) %>%
+  # Do not only take consecutive observations (as this removes users that don't have those)
+  group_map(~ process_group(.x, filter_d = FALSE), .keep = TRUE) %>%
+  bind_rows()
+
+df_consistency <- df_filtered %>%
+  group_by(sub) %>%
+  arrange(sub, time) %>%
+  mutate(across(starts_with('habit'), 
+                ~ ifelse(is.na(lag(.)), NA, . == lag(.)),
+                .names = 'match_{col}'))
+```
+
+```{r}
+# Identify continuous segments on all data
+df_segment <- df_wide %>%
+  group_by(sub) %>%
+  group_map(~ process_group(.x, filter_d = FALSE), .keep = TRUE) %>%
+  bind_rows() %>% 
+  mutate(segment = cumsum(lag(time, default = first(time)) - time != -1)) %>% 
+  ungroup() %>% 
+  select(sub, time, segment, everything())
+
+df_avg_segment <- df_segment %>%
+  group_by(sub, segment) %>% 
+  summarize(segment_n = n()) %>%
+  group_by(sub) %>% 
+  summarize(
+    segment_mean = mean(segment_n),
+    segment_median = median(segment_n),
+    segment_max = max(segment_n)
+  ) %>% 
+  arrange(desc(segment_mean))
+
+df_avg_gap <- df_segment %>%
+  group_by(sub) %>%
+  arrange(time) %>%
+  # Difference in time between segments
+  mutate(segment_time_diff = time - lag(time, default = first(time))) %>%
+  
+  # Only get the first difference
+  group_by(sub, segment) %>%
+  summarise(start_time_diff = first(segment_time_diff)) %>%
+  
+  # Average time differences
+  group_by(sub) %>%
+  summarise(
+    time_diff_mean = mean(start_time_diff, na.rm = TRUE),
+    time_diff_median = median(start_time_diff, na.rm = TRUE),
+    time_diff_max = max(start_time_diff, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+df_avg_seggap <- df_avg_segment %>% 
+  left_join(df_avg_gap, by = 'sub')
+
+
+dice_similarity <- function(row1, row2) {
+  intersection <- sum(row1 & row2)
+  total <- sum(row1) + sum(row2)
+  if (total == 0) return(NA)
+  return(2 * intersection / total)
+}
+
+get_similarity_df <- function(df_consistency, similarity_fn) {
+  uniq_subs <- unique(df_consistency$sub)
+  df_sim <- data.frame(sub = NA, similarity = NA)
+  
+  for (sub in uniq_subs) {
+    df_sel <- df_consistency %>%
+      filter(sub == !!sub) %>%
+      ungroup() %>% 
+      select(habit_cols)
+    
+    sims <- c()
+    
+    for (i in seq(2, nrow(df_sel))) {
+      similarity <- similarity_fn(as.numeric(df_sel[i, ]), as.numeric(df_sel[i - 1, ]))
+      sims <- c(sims, similarity)
+    }
+    
+    df_sim <- rbind(df_sim, c(sub, mean(sims, na.rm = TRUE)))
+  }
+  
+  df_sim <- df_sim[-1, ]
+  df_sim$similarity <- as.numeric(df_sim$similarity)
+  df_sim
+}
+
+habit_cols <- grep('^habit', names(df_consistency), value = TRUE)
+df_dice <- get_similarity_df(df_consistency, dice_similarity)
+
+pconsistency <- ggplot(df_dice, aes(x = similarity)) +
+  geom_histogram(aes(y = after_stat(count / sum(count)))) +
+  scale_x_continuous(breaks = seq(0, 1, 0.10), limits = c(0.00, 1.0)) +
+  theme_minimal() +
+  ylab('') +
+  xlab('Mean Dice similarity') +
+  ggtitle('Mean similarity of action reports') +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.50), legend.position = 'none'
+  )
+
+psegment <- ggplot(df_avg_seggap, aes(x = segment_mean)) +
+  geom_histogram(aes(y = after_stat(count / sum(count)))) +
+  scale_x_continuous(trans = 'log10', breaks = c(1, 2, 3, 4, 5, 10, 20, 40, 100)) +
+  theme_minimal() +
+  ylab('') +
+  xlab('Mean segment size') +
+  ggtitle('Mean size of continuous segment') +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.50), legend.position = 'none'
+  )
+
+pgap <- ggplot(df_avg_seggap, aes(x = time_diff_mean)) +
+  geom_histogram(aes(y = after_stat(count / sum(count)))) +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0, 160, 20)) +
+  ylab('Proportion') +
+  xlab('Mean gap size') +
+  ggtitle('Mean size of gap between segments') +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.50), legend.position = 'none'
+  )
+
+c(mean(df_dice$similarity), sd(df_dice$similarity))
+c(mean(df_avg_seggap$segment_mean), sd(df_avg_seggap$segment_mean))
+c(mean(df_avg_seggap$time_diff_mean), sd(df_avg_seggap$time_diff_mean))
+```
+
+We combine these three figures.
+
+```{r, fig.height = 9}
+pdf('figures/Figure2.pdf', width = 9, height = 9)
+grid.arrange(
+  psequences, psegment, pgap, pconsistency, ncol = 2,
+  layout_matrix = matrix(c(1, 1, 1, 2, 3, 4), nrow = 3, ncol = 2)
+)
+dev.off()
+grid.arrange(
+  psequences, psegment, pgap, pconsistency, ncol = 2,
+  layout_matrix = matrix(c(1, 1, 1, 2, 3, 4), nrow = 3, ncol = 2)
+)
+```
+
+
+## Figure 3 + Figure S3: Most frequent actions
+We compute the mean number of actions per week for the different categories.
+
+```{r}
+# Combine weekly data with country data
+df_country_week <- df_action_weekly %>%
+  filter(sub %in% df_act_clean$sub) %>% 
+  left_join(activity_table_ext %>% select(sub, country), by = c('sub')) %>% 
+  filter(!is.na(habit_name)) # remove the right-padded weeks
+
+df_weeks_user_active <- df_country_week %>% 
+  group_by(sub) %>% 
+  summarize(nr_weeks_active = length(unique(week_start)))
+
+df_freq_avg <- df_country_week %>% 
+  # Group by person and action, count number of actions
+  group_by(sub, habit_name) %>% 
+  summarize(nr_act = n()) %>% 
+  left_join(df_weeks_user_active, by = 'sub') %>% 
+  # Calculate mean number of action per week
+  mutate(n_per_week = nr_act / nr_weeks_active) %>% 
+  left_join(df_act_clean %>% select(sub, country) %>% distinct(.keep_all = TRUE), by = 'sub') %>% 
+  left_join(df_country_week %>% select(habit_name, category) %>% distinct(.keep_all = TRUE), by = 'habit_name')
+
+top10_actions_week_avg_category <- df_freq_avg %>% 
+  group_by(habit_name) %>% 
+  summarize(
+    n_per_week_avg = mean(n_per_week),
+    sd_per_week_avg = sd(n_per_week),
+    se_per_week_avg = sd(n_per_week) / sqrt(n())
+  ) %>% 
+  mutate(country = 'All') %>% 
+  left_join(
+    df_freq_avg %>% ungroup() %>% select(habit_name, category) %>% distinct(habit_name, category),
+    by = 'habit_name'
+  ) %>% 
+  arrange(category, desc(n_per_week_avg)) %>% 
+  filter(category %in% c('Energy', 'Mobility', 'Food', 'Purchase')) %>% 
+  group_by(category) %>% 
+  slice_head(n = 10)
+
+df_freq_country_avg_category <- df_freq_avg %>% 
+  filter(
+    country %in% c('IT', 'US', 'MX'),
+    habit_name %in% top10_actions_week_avg_category$habit_name
+  ) %>% 
+  group_by(habit_name, country) %>% 
+  summarize(
+    n_per_week_avg = mean(n_per_week),
+    sd_per_week_avg = sd(n_per_week),
+    se_per_week_avg = sd(n_per_week) / sqrt(n())
+  ) %>% 
+  mutate(
+    country = case_when(
+      country == 'MX' ~ 'Mexico',
+      country == 'IT' ~ 'Italy',
+      country == 'US' ~ 'USA'
+    )
+  ) %>% 
+  left_join(
+    df_freq_avg %>% ungroup() %>% select(habit_name, category) %>% distinct(habit_name, category),
+    by = 'habit_name'
+  ) %>% 
+  select(colnames(top10_actions_week_avg_category))
+
+# Useful later to distinguish the three top countries in terms of users
+df_freq_country_avg_category <- bind_rows(df_freq_country_avg_category, top10_actions_week_avg_category)
+df_freq_country_avg_category$habit_name <- factor(
+  df_freq_country_avg_category$habit_name, levels = rev(top10_actions_week_avg_category$habit_name)
+)
+df_freq_country_avg_category$category <- factor(
+  df_freq_country_avg_category$category, levels = c('Energy', 'Food', 'Mobility', 'Purchase')
+)
+df_freq_country_avg_category$country <- factor(
+  df_freq_country_avg_category$country, levels = rev(c('Italy', 'USA', 'Mexico', 'All'))
+)
+
+cols <- c('gray56', '#D95F02', '#7570B3', '#1B9E77')
+
+pwidth <- 0.90
+p_country_cat <- ggplot(
+  df_freq_country_avg_category %>% filter(country == 'All'),
+  aes(x = n_per_week_avg, y = habit_name, fill = country)
+) +
+  geom_bar(stat = 'identity', position = position_dodge(width = pwidth), width = 0.75) +
+  geom_point(
+    aes(x = n_per_week_avg, y = habit_name), position = position_dodge(width = pwidth),
+    size = 2, show.legend = FALSE, color = 'black'
+  ) +
+  geom_errorbar(
+    aes(xmin = n_per_week_avg - 1.96 * se_per_week_avg, xmax = n_per_week_avg + 1.96 * se_per_week_avg),
+    position = position_dodge(width = pwidth),
+    width = 0.40, linewidth = 1, show.legend = FALSE, color = 'black'
+  ) +
+  geom_point(
+    aes(x = n_per_week_avg, y = habit_name, col = country), position = position_dodge(width = pwidth),
+    size = 1, show.legend = FALSE
+  ) +
+  geom_errorbar(
+    aes(
+      xmin = n_per_week_avg - 1.96 * se_per_week_avg,
+      xmax = n_per_week_avg + 1.96 * se_per_week_avg,
+      col = country
+    ),
+    position = position_dodge(width = pwidth),
+    width = 0.30, linewidth = 0.30,
+    show.legend = FALSE
+  ) +
+  ylab('') +
+  xlab('Mean number of actions per week') +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(
+    values = cols, labels = rev(c('Italy', 'USA', 'Mexico', 'All')),
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  scale_x_continuous(breaks = seq(0, 2, 0.50), limits = c(0, 2.2)) +
+  facet_wrap(~ category, scales = 'free_y', nrow = 2) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = 'none',
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.50, size = 16),
+    axis.text.y = element_text(margin = margin(r = -5), size = 8),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.spacing.x = unit(-2, 'lines')
+  ) + guides(fill = guide_legend(reverse = TRUE), color = FALSE)
+
+ggsave('figures/Figure3.pdf', p_country_cat, width = 10, height = 10)
+p_country_cat
+```
+
+Below, we calculate the mean number of actions across categories for the different countries. This is Supplementary figure 2.
+
+```{r}
+df_freq_avg_cat <- df_country_week %>% 
+  # Group by person and action, count number of actions
+  group_by(sub, category) %>% 
+  summarize(nr_act = n()) %>% 
+  left_join(df_weeks_user_active, by = 'sub') %>% 
+  # Calculate mean number of action per week
+  mutate(n_per_week = nr_act / nr_weeks_active) %>% 
+  left_join(df_act_clean %>% select(sub, country) %>% distinct(.keep_all = TRUE), by = 'sub') %>% 
+  filter(
+    category %in% c('Energy', 'Food', 'Mobility', 'Purchase'),
+    country %in% c('IT', 'US', 'MX')
+  ) %>% 
+  group_by(country, category) %>% 
+  summarize(
+    n_per_week_avg = mean(n_per_week),
+    sd_per_week_avg = sd(n_per_week),
+    se_per_week_avg = sd(n_per_week) / sqrt(n())
+  ) %>% 
+  mutate(
+    category = factor(category, levels = rev(c('Energy', 'Food', 'Mobility', 'Purchase'))),
+    country = factor(country, levels = rev(c('IT', 'MX', 'US')))
+  )
+
+cols <- c('grey56', '#D95F02', '#7570B3', '#1B9E77')[seq(2, 4)]
+p_country_cat_diff <- ggplot(
+  df_freq_avg_cat, aes(x = n_per_week_avg, y = category, fill = country)
+) +
+  geom_bar(stat = 'identity', position = position_dodge(width = pwidth), width = 0.75) +
+  geom_point(
+    aes(x = n_per_week_avg, y = category), position = position_dodge(width = pwidth),
+    size = 2, show.legend = FALSE, color = 'black'
+  ) +
+  geom_errorbar(
+    aes(xmin = n_per_week_avg - 1.96 * se_per_week_avg, xmax = n_per_week_avg + 1.96 * se_per_week_avg),
+    position = position_dodge(width = pwidth),
+    width = 0.40, linewidth = 1, show.legend = FALSE, color = 'black'
+  ) +
+  geom_point(
+    aes(x = n_per_week_avg, y = category, col = country), position = position_dodge(width = pwidth),
+    size = 1, show.legend = FALSE
+  ) +
+  geom_errorbar(
+    aes(
+      xmin = n_per_week_avg - 1.96 * se_per_week_avg,
+      xmax = n_per_week_avg + 1.96 * se_per_week_avg,
+      col = country
+    ),
+    position = position_dodge(width = pwidth),
+    width = 0.30, linewidth = 0.30,
+    show.legend = FALSE
+  ) +
+  ylab('') +
+  xlab('Mean number of actions per week') +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(
+    values = cols, labels = rev(c('Italy', 'USA', 'Mexico')),
+    guide = guide_legend(reverse = FALSE)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = 'top',
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.50, size = 16),
+    axis.text.y = element_text(margin = margin(r = -5), size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.spacing.x = unit(-2, 'lines')
+  ) + guides(fill = guide_legend(reverse = TRUE), color = FALSE)
+
+ggsave('figures/FigureS3.pdf', p_country_cat_diff, width = 8, height = 10)
+p_country_cat_diff
+```
+
+## Figure 4: Carbon footprint and number of actions
+We read in the carbon footprint data.
+
+```{r}
+df_footprint <- read.csv('footprint.csv') %>%
+  mutate(footprint_date = as.Date(footprint_date)) %>% 
+  rename(sub = user_id)
+
+df_footprint_qs <- read.csv('footprint_survey_answers.csv') %>% 
+  rename(sub = user_id)
+```
+
+We merge the footprint data with the clean action data.
+
+```{r}
+df_act_sum <- df_act_clean %>%
+  left_join(
+    df_footprint %>%
+      select(sub, footprint_date) %>%
+      distinct(sub, footprint_date),
+    by = 'sub'
+  ) %>% 
+  group_by(sub) %>% 
+  mutate(
+    first_action_date = min(logged_habit),
+    last_action_date = max(logged_habit),
+    days_on_app = length(unique(logged_habit)),
+    before_footprint = logged_habit <= footprint_date
+  ) %>% 
+  group_by(sub, category) %>%
+  summarize(
+    n_act = n(),
+    n_act_before_footprint = sum(before_footprint, na.rm = TRUE),
+    joined_app_date = as.Date(logged_habit[1]),
+    first_action_date = as.Date(first_action_date[1]),
+    last_action_date = as.Date(last_action_date[1]),
+    days_on_app = days_on_app[1],
+    time_span = as.numeric(last_action_date - first_action_date),
+    co2saved = sum(co2)
+  )
+
+# Collapse across categories
+df_total_act <- df_act_sum %>% 
+  group_by(sub) %>% 
+  summarize(n_act = sum(n_act))
+
+# Actions and footprints per category
+df_info_spec <- df_act_sum %>%
+  left_join(
+    df_footprint %>%
+      pivot_wider(names_from = category, values_from = emission) %>% 
+      mutate(footprint_date = as.Date(footprint_date)), by = 'sub'
+  ) %>% ungroup() %>% 
+  mutate(n_act_log = log(n_act, base = 2))
+
+# Overall actions and overall footprint
+df_info <- df_info_spec %>%
+  group_by(sub) %>% 
+  reframe(
+    n_act = sum(n_act),
+    emissions = Transport + Home + Diet + Lifestyle,
+    footprint_date = footprint_date
+  ) %>% distinct() %>% na.omit() %>% 
+  mutate(emissions_log = log(emissions, base = 2))
+
+df_spec <- na.omit(df_info_spec) %>%
+  mutate(
+    days_diff_joined_action = as.numeric(joined_app_date - first_action_date),
+    days_diff_action_footprint = as.numeric(footprint_date - first_action_date)
+  )
+
+# Filled out carbon footprint in the study period
+nrow(df_info)
+```
+
+We prepare the data and create a figure without regression lines.
+
+```{r}
+psize <- 1.5
+tsize <- 18
+col_all <- 'gray56'
+blue <- brewer.pal(9, 'Blues')[5]
+green <- brewer.pal(9, 'Greens')[5]
+purple <- brewer.pal(9, 'Purples')[5]
+
+df_food <- filter(df_info_spec, category == 'Food')
+df_lifestyle <- filter(df_info_spec, category == 'Purchase')
+df_mob <- filter(df_info_spec, category == 'Mobility')
+df_home <- filter(df_info_spec, category == 'Energy')
+
+df_mob <- df_mob %>% 
+  group_by(sub) %>% 
+  summarize(n_act = sum(n_act)) %>%
+  left_join(df_mob %>% select(-n_act) %>% distinct(sub, .keep_all = TRUE), by = 'sub') %>% 
+  mutate(category = 'Mobility') %>% 
+  filter(!is.na(Transport), Transport > 0, !is.na(footprint_date)) %>% 
+  mutate(
+    days_on_app = days_on_app - mean(days_on_app),
+    Transport_log = log(Transport, base = 2)
+  )
+
+df_food <- df_food %>%
+  filter(!is.na(Diet), Diet > 0, !is.na(footprint_date)) %>% 
+   mutate(
+     days_on_app = days_on_app - mean(days_on_app),
+     Diet_log = log(Diet, base = 2)
+   )
+
+df_lifestyle <- df_lifestyle %>%
+  filter(!is.na(Lifestyle), Lifestyle > 0, !is.na(footprint_date)) %>% 
+   mutate(
+     days_on_app = days_on_app - mean(days_on_app),
+     Lifestyle_log = log(Lifestyle, base = 2)
+   )
+
+df_home <- df_home %>%
+  filter(!is.na(Home), Lifestyle > 0, !is.na(footprint_date)) %>% 
+   mutate(
+     days_on_app = days_on_app - mean(days_on_app),
+     Home_log = log(Home, base = 2)
+   )
+
+# Run regression adjusting for the number of days spent on the app
+fit_mob <- regressionBF(Transport ~ n_act + days_on_app, data = df_mob)
+fit_food <- regressionBF(Diet ~ n_act + days_on_app, data = df_food)
+fit_lifestyle <- regressionBF(Lifestyle ~ n_act + days_on_app, data = df_lifestyle)
+fit_home <- regressionBF(Home ~ n_act + days_on_app, data = df_home)
+
+p_all <- ggplot(df_info, aes(x = n_act, y = emissions)) +
+  geom_point(color = col_all, size = psize, alpha = 0.60) +
+  scale_y_continuous(trans = 'log2', breaks = c(500, 2^seq(0, 6) * 1000)) +
+  scale_x_continuous(trans = 'log2', breaks = 2^seq(0, 14, 2)) +
+  labs(
+    y = 'Carbon footprint (kgCO2-eq)',
+    x = '',
+    title = 'Overall'
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = tsize, hjust = 0.50), legend.position = 'none')
+
+p_mob <- ggplot(df_mob, aes(x = n_act, y = Transport)) +
+  geom_point(color = blue, size = psize, alpha = 0.60) +
+  scale_y_continuous(trans = 'log2', breaks = c(1, 10, 100, 2^seq(0, 6) * 1000)) +
+  scale_x_continuous(trans = 'log2', breaks = 2^seq(0, 13, 2)) +
+  labs(
+    title = 'Mobility',
+    x = '',
+    y = ''
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = tsize, hjust = 0.50), legend.position = 'none')
+
+p_food <- ggplot(df_food, aes(x = n_act, y = Diet)) +
+  geom_point(color = green, size = psize, alpha = 0.60) +
+  scale_y_continuous(trans = 'log2', breaks = c(250, 500, 1000, 2000, 4000)) +
+  scale_x_continuous(trans = 'log2', breaks = 2^seq(0, 13, 2)) +
+  labs(
+    title = 'Food',
+    y = '',
+    x = 'Number of reported actions',
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = tsize, hjust = 0.50), legend.position = 'none')
+
+p_lifestyle <- ggplot(df_lifestyle, aes(x = n_act, y = Lifestyle)) +
+  geom_point(color = purple, size = psize, alpha = 0.60) +
+  scale_y_continuous(trans = 'log2', breaks = c(1, 10, 100, 2^seq(0, 6) * 1000)) +
+  scale_x_continuous(trans = 'log2', breaks = 2^seq(0, 13, 2)) +
+  labs(
+    title = 'Purchase',
+    x = 'Number of reported actions',
+    y = 'Carbon footprint (kgCO2-eq)'
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = tsize, hjust = 0.50), legend.position = 'none')
+p1 <- ggMarginal(p_all, type = 'histogram', fill = col_all)
+p2 <- ggMarginal(p_mob, type = 'histogram', fill = blue)
+p3 <- ggMarginal(p_lifestyle, type = 'histogram', fill = purple)
+p4 <- ggMarginal(p_food, type = 'histogram', fill = green)
+# figure <- grid.arrange(p1, p2, p3, p4, nrow = 2, ncol = 2)
+# ggsave('figures/Figure3_footprint.pdf', figure, width = 10, height = 10)
+```
+
+We run regressions adjusting for time spent on app and create a figure with regression lines.
+
+```{r}
+df_emissions <- df_info %>% 
+    left_join(df_info_spec %>% select(sub, days_on_app, n_act_log), by = 'sub') %>% 
+    distinct(sub, .keep_all = TRUE)
+
+# Sample sizes
+nrow(df_emissions)
+nrow(df_mob)
+nrow(df_food)
+nrow(df_lifestyle)
+```
+
+```{r}
+fit_all_log <- regressionBF(emissions_log ~ n_act_log + days_on_app, data = df_emissions)
+fit_mob_log <- regressionBF(Transport_log ~ n_act_log + days_on_app, data = df_mob)
+fit_food_log <- regressionBF(Diet_log ~ n_act_log + days_on_app, data = df_food)
+fit_lifestyle_log <- regressionBF(Lifestyle_log ~ n_act_log + days_on_app, data = df_lifestyle)
+
+fit_all_log[2] / fit_all_log[3]
+fit_mob_log[2] / fit_mob_log[3]
+fit_food_log[3] / fit_food_log[2]
+fit_lifestyle_log[2] / fit_lifestyle_log[3]
+```
+
+```{r}
+# Get effect for food
+post <- posterior(fit_food_log[3], iterations = 4000)
+apply(post, 2, mean)
+apply(post, 2, quantile, 0.025)
+apply(post, 2, quantile, 0.975)
+
+get_post_pred <- function(fit, df, iterations = 1000, varname = 'n_act_log', type = 'other') {
+  post <- posterior(fit, iterations = iterations)
+  
+  if (type == 'other') {
+    values <- seq(0, max(df[, varname]), 1)
+  } else {
+    values <- seq(1, 14, 1)
+  }
+  
+  preds <- lapply(seq(iterations), function(iter) {
+    post[iter, 'mu'] + values * post[iter, varname]
+  })
+  
+  # iterations x n_act
+  preds <- do.call('rbind', preds)
+  
+  preds_mean <- apply(preds, 2, mean)
+  preds_lo <- apply(preds, 2, quantile, 0.025)
+  preds_hi <- apply(preds, 2, quantile, 0.975)
+  
+  df <- data.frame('preds_mean' = preds_mean, 'ci_lo' = preds_lo, 'ci_hi' = preds_hi)
+  df[['n_act']] <- values
+  2^df
+}
+
+preds_all <- get_post_pred(fit_all_log[3], df_emissions, type = 'all')
+
+preds_food <- get_post_pred(fit_food_log[3], df_food)
+preds_mob <- get_post_pred(fit_mob_log[3], df_mob)
+preds_lifestyle <- get_post_pred(fit_lifestyle_log[3], df_lifestyle)
+
+p_all_reg <- p_all + 
+  geom_ribbon(data = preds_all, aes(x = n_act, y = preds_mean, ymin = ci_lo, ymax = ci_hi), alpha = 0.30) +
+  geom_line(data = preds_all, aes(x = n_act, y = preds_mean), size = 0.75)
+
+p_food_reg <- p_food + 
+  geom_ribbon(data = preds_food, aes(x = n_act, y = preds_mean, ymin = ci_lo, ymax = ci_hi), alpha = 0.30) +
+  geom_line(data = preds_food, aes(x = n_act, y = preds_mean), size = 0.75)
+
+p_mob_reg <- p_mob + 
+  geom_ribbon(data = preds_mob, aes(x = n_act, y = preds_mean, ymin = ci_lo, ymax = ci_hi), alpha = 0.30) +
+  geom_line(data = preds_mob, aes(x = n_act, y = preds_mean), size = 0.75)
+
+p_lifestyle_reg <- p_lifestyle + 
+  geom_ribbon(data = preds_lifestyle, aes(x = n_act, y = preds_mean, ymin = ci_lo, ymax = ci_hi), alpha = 0.30) +
+  geom_line(data = preds_lifestyle, aes(x = n_act, y = preds_mean), size = 0.75)
+
+p1_reg <- ggMarginal(p_all_reg, type = 'histogram', fill = col_all)
+p2_reg <- ggMarginal(p_mob_reg, type = 'histogram', fill = blue)
+p3_reg <- ggMarginal(p_lifestyle_reg, type = 'histogram', fill = purple)
+p4_reg <- ggMarginal(p_food_reg, type = 'histogram', fill = green)
+figure_reg <- grid.arrange(p1_reg, p2_reg, p3_reg, p4_reg, nrow = 2, ncol = 2)
+
+ggsave('figures/Figure4.pdf', figure_reg, width = 10, height = 10)
+grid.arrange(p1_reg, p2_reg, p3_reg, p4_reg, nrow = 2, ncol = 2)
+```
+
+## Figure 5: Psychological variables and number of actions
+We read the survey results in and prepare it for analysis.
+
+```{r}
+df <- rbind(
+  read_excel('survey.xlsx', sheet = 1),
+  read_excel('survey.xlsx', sheet = 2)
+)
+
+cnames_eng <- c(
+  'language', 'email', 'gender', 'age', 'residence',
+  'environmentalist_a', 'environmentalist_b', 'environmentalist_c', 'environmentalist_d',
+  'fundamental_change', 'efficacy_a', 'efficacy_b', 'efficacy_c', 'inner_circle', 'app_helped',
+  'why_aworld_a', 'why_aworld_b'
+)
+cnames_it <- paste0(cnames_eng[-1], '_it')
+
+other <- c(
+  'sha', 'politics_it', 'education_status_it', 'status_it', 'education_status',
+  'politics', 'status', 'education', 'education_it', 'submitted_at', 'token'
+)
+cnames <- c(cnames_eng, cnames_it, other)
+
+colnames(df) <- cnames
+df_fin <- df %>% 
+  mutate(
+    gender = coalesce(gender, gender_it),
+    age = coalesce(age, age_it),
+    residence = coalesce(residence, residence_it),
+    environmentalist_a = coalesce(environmentalist_a, environmentalist_a_it),
+    environmentalist_b = coalesce(environmentalist_b, environmentalist_b_it),
+    environmentalist_c = coalesce(environmentalist_c, environmentalist_c_it),
+    environmentalist_d = coalesce(environmentalist_d, environmentalist_d_it),
+    environmentalist = (environmentalist_a + environmentalist_b + environmentalist_c + environmentalist_d) / 4,
+    fundamental_change = coalesce(fundamental_change, fundamental_change_it),
+    efficacy_a = coalesce(efficacy_a, efficacy_a_it),
+    efficacy_b = coalesce(efficacy_b, efficacy_b_it),
+    efficacy_c = coalesce(efficacy_c, efficacy_c_it),
+    efficacy = (efficacy_a + efficacy_b + efficacy_c) / 3,
+    inner_circle = coalesce(inner_circle, inner_circle_it),
+    app_helped = coalesce(app_helped, app_helped_it),
+    why_aworld_a = coalesce(why_aworld_a, why_aworld_a_it),
+    why_aworld_b = coalesce(why_aworld_b, why_aworld_b_it)
+  ) %>% 
+  select(-matches('_it'), -email) %>%
+  mutate(
+    residence = case_when(
+      residence == 'Periferia, vicino a una grande città' ~ 'Suburb near a large city',
+      residence == 'Piccola città o paese' ~ 'Small city or town',
+      residence == 'Area rurale' ~ 'Rural area',
+      residence == 'Grande città' ~ 'Large city',
+      TRUE ~ residence
+    ),
+    app_helped = ifelse(app_helped == 'Si', 'Yes', app_helped)
+  ) %>% 
+  filter(!is.na(sha))
+```
+
+```{r}
+## Joining with action data
+df_matching <- read.csv('aworld_bigquery.csv')
+
+df_fin <- df_fin %>% 
+  group_by(sha) %>% 
+  mutate(n = n()) %>% 
+  filter(n == 1) %>% 
+  left_join(df_matching, by = 'sha')
+
+df_match <- df_fin %>% 
+  select(sub, language, gender, age, residence, environmentalist, efficacy, status, politics, inner_circle) %>% 
+  inner_join(
+    df_act_sum %>% 
+      select(sub, category, n_act),
+    by = 'sub'
+  ) %>% 
+  ungroup() %>% 
+  filter(category %in% c('Food', 'Mobility', 'Purchase')) %>% 
+  rename(n = n_act) %>% 
+  select(-sha)
+
+# Only 334 have logged behavior
+n_logged <- nrow(df_fin %>% filter(sub %in% unique(activity_table_ext$sub)))
+print(n_logged)
+nrow(df_fin) - n_logged
+
+# And then from those 334 we only retain 132, because the rest didn't make the data cleaning
+n_cleaned <- nrow(df_match %>% distinct(sub))
+n_cleaned
+n_logged - n_cleaned
+```
+
+```{r}
+df_psych <- df_match %>% 
+  select(sub, environmentalist, efficacy, inner_circle, n, category) %>% 
+  pivot_longer(cols = -c(n, sub, category)) %>% 
+  mutate(
+    name = case_when(
+      name == 'efficacy' ~ 'Perceived effectiveness of individual action',
+      name == 'environmentalist' ~ 'Environmentalist identity',
+      name == 'inner_circle' ~ 'Climate concern in inner circle'
+    ),
+    name = factor(
+      name,
+      levels = c(
+        'Environmentalist identity',
+        'Perceived effectiveness of individual action',
+        'Climate concern in inner circle'
+      )
+    )
+  ) %>% 
+  left_join(
+    df_act_sum %>%
+      select(sub, days_on_app) %>%
+      distinct(sub, days_on_app) %>% 
+      ungroup() %>% 
+      mutate(
+        days_on_app_raw = days_on_app,
+        days_on_app = days_on_app - mean(days_on_app)
+      )
+    , by = 'sub'
+  ) %>% 
+  mutate(
+    log_n = log(n, base = 2),
+    category = factor(category, levels = c('Mobility', 'Purchase', 'Food'))
+  )
+```
+
+Description of the sample.
+
+```{r}
+x <- df_psych %>% distinct(sub, .keep_all = TRUE)
+mean(x$days_on_app_raw)
+median(x$days_on_app_raw)
+sd(x$days_on_app_raw)
+
+df_psych %>% 
+  distinct(sub, category, .keep_all = TRUE) %>% 
+  group_by(category) %>% 
+  summarize(n = sum(n))
+```
+
+We create a scatterplot figure and later add the regression lines.
+
+```{r}
+blue <- brewer.pal(9, 'Blues')[5]
+green <- brewer.pal(9, 'Greens')[5]
+purple <- brewer.pal(9, 'Purples')[5]
+cols <- c(blue, purple, green)
+
+ppsych <- ggplot(df_psych, aes(y = value, x = n, color = category)) +
+  geom_jitter(width = 0.1, height = 0.1, alpha = 1) +
+  # geom_jitter(width = 0, height = 0, alpha = 0.50) +
+  scale_color_manual('', values = cols) +
+  scale_x_continuous(
+    name = 'Number of actions',
+    labels = label_number(big.mark = ','),
+    trans = 'log2', breaks = c(1, 10, 100, 1000, 10000, 10000, 100000)
+  ) +
+  scale_y_continuous(name = '', breaks = seq(1, 7)) +
+  facet_wrap(~ name) +
+  theme_minimal() +
+  theme(
+    legend.position = 'top',
+    strip.text = element_text(size = 12)
+    # legend.title = element_blank()
+  ) + coord_flip()
+
+# Number of participants of the survey
+length(unique(df_psych$sub))
+
+# Total number of actions by the users who filled out the survey
+sum((activity_table_ext %>% filter(sub %in% unique(df_psych$sub)))$n)
+```
+
+We run regressions adjusting for time spent on the app and create a figure with the regression lines.
+
+```{r}
+df_identity <- filter(df_psych, !is.na(days_on_app), name == 'Environmentalist identity')
+df_effectiveness <- filter(df_psych, !is.na(days_on_app), name == 'Perceived effectiveness of individual action')
+df_concern <- filter(df_psych, !is.na(days_on_app), name == 'Climate concern in inner circle')
+
+# Per category
+## Environmentalist identity
+fit_identity_mob <- regressionBF(log_n ~ value + days_on_app, data = df_identity %>% filter(category == 'Mobility'))
+fit_identity_mob[2] / fit_identity_mob[3]
+
+fit_identity_purchase <- regressionBF(log_n ~ value + days_on_app, data = df_identity %>% filter(category == 'Purchase'))
+fit_identity_purchase[2] / fit_identity_purchase[3]
+
+fit_identity_food <- regressionBF(log_n ~ value + days_on_app, data = df_identity %>% filter(category == 'Food'))
+fit_identity_food[2] / fit_identity_food[3]
+
+## Effectiveness
+fit_eff_mob <- regressionBF(log_n ~ value + days_on_app, data = df_effectiveness %>% filter(category == 'Mobility'))
+fit_eff_mob[2] / fit_eff_mob[3]
+
+fit_eff_purchase <- regressionBF(log_n ~ value + days_on_app, data = df_effectiveness %>% filter(category == 'Purchase'))
+fit_eff_purchase[2] / fit_eff_purchase[3]
+
+fit_eff_food <- regressionBF(log_n ~ value + days_on_app, data = df_effectiveness %>% filter(category == 'Food'))
+fit_eff_food[2] / fit_eff_food[3]
+
+## Concern
+fit_concern_mob <- regressionBF(log_n ~ value + days_on_app, data = df_concern %>% filter(category == 'Mobility'))
+fit_concern_mob[2] / fit_concern_mob[3]
+
+fit_concern_purchase <- regressionBF(log_n ~ value + days_on_app, data = df_concern %>% filter(category == 'Purchase'))
+fit_concern_purchase[2] / fit_concern_purchase[3]
+
+fit_concern_food <- regressionBF(log_n ~ value + days_on_app, data = df_concern %>% filter(category == 'Food'))
+fit_concern_food[2] / fit_concern_food[3]
+```
+
+```{r, fig.height = 4, fig.width = 8}
+get_post_pred2 <- function(
+    fit, df, iterations = 1000,
+    category = 'Food', varname = 'log_n', type = 'other'
+  ) {
+  
+  if (!is.null(category)) {
+    df <- df[df$category == category, ]
+  }
+  
+  post <- posterior(fit, iterations = iterations)
+  values <- seq(1, 7, 0.05) - mean(seq(1, 7, 0.05))
+  
+  preds <- lapply(seq(iterations), function(iter) {
+    post[iter, 'mu'] + values * post[iter, varname]
+  })
+  
+  # iterations x n_act
+  preds <- do.call('rbind', preds)
+  
+  preds_mean <- apply(preds, 2, mean)
+  preds_lo <- apply(preds, 2, quantile, 0.025)
+  preds_hi <- apply(preds, 2, quantile, 0.975)
+  
+  df <- data.frame(
+    'preds_mean' = preds_mean, 'ci_lo' = preds_lo,
+    'ci_hi' = preds_hi, 'category' = ifelse(is.null(category), '', category)
+  )
+  df[['values']] <- seq(1, 7, 0.05)
+  df
+}
+
+preds_identity <- bind_rows(
+  get_post_pred2(fit_identity_food[3], df_identity, category = 'Food', varname = 'value'),
+  get_post_pred2(fit_identity_mob[3], df_identity, category = 'Mobility', varname = 'value'),
+  get_post_pred2(fit_identity_purchase[3], df_identity, category = 'Purchase', varname = 'value')
+)
+
+preds_effectiveness <- bind_rows(
+  get_post_pred2(fit_eff_food[3], df_effectiveness, category = 'Food', varname = 'value'),
+  get_post_pred2(fit_eff_mob[3], df_effectiveness, category = 'Mobility', varname = 'value'),
+  get_post_pred2(fit_eff_purchase[3], df_effectiveness, category = 'Purchase', varname = 'value')
+)
+
+preds_concern <- bind_rows(
+  get_post_pred2(fit_concern_food[3], df_concern, category = 'Food', varname = 'value'),
+  get_post_pred2(fit_concern_mob[3], df_concern, category = 'Mobility', varname = 'value'),
+  get_post_pred2(fit_concern_purchase[3], df_concern, category = 'Purchase', varname = 'value')
+)
+
+preds <- bind_rows(
+  preds_identity %>% mutate(name = 'Environmentalist identity'),
+  preds_effectiveness %>% mutate(name = 'Perceived effectiveness of individual action'),
+  preds_concern %>% mutate(name = 'Climate concern in inner circle')
+) %>% 
+  mutate(
+    name = factor(
+      name,
+      levels = c(
+        'Environmentalist identity',
+        'Perceived effectiveness of individual action',
+        'Climate concern in inner circle'
+      )
+    ),
+    category = factor(category, levels = c('Mobility', 'Purchase', 'Food'))
+  )
+
+ppsych_reg <- ppsych + coord_flip() +
+  geom_ribbon(
+    data = preds,
+    aes(x = 2^preds_mean, y = values, xmin = 2^ci_lo, xmax = 2^ci_hi, fill = category),
+    alpha = 0.2, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = cols) +
+  geom_line(data = preds, aes(x = 2^preds_mean, y = values, color = category), size = 1) +
+  guides(fill = FALSE)
+
+ggsave('figures/Figure5.pdf', ppsych_reg, width = 11, height = 5)
+ppsych_reg
+```
+
+# Extended Data
+## Exented Data Figure 1: Effect of data cleaning
+We assess what fraction of people and actions we lose for different app activity and behavioural thresholds. 
+
+```{r, fig.width = 8, fig.height = 7}
+df_cutoffs <- expand.grid(
+  total_weeks_active = seq(1, 10, 1),
+  distinct_violations = seq(0, 10, 1)
+)
+
+library(doParallel)
+registerDoParallel(cores = 6)
+
+start <- Sys.time()
+df_retained <- foreach(i = seq(nrow(df_cutoffs))) %dopar% {
+  
+  distinct_viol <- df_cutoffs[[i, 'distinct_violations']]
+  total_log <- df_cutoffs[[i, 'total_weeks_active']]
+  
+  df_clean <- get_cleaned_df(df_action_weekly, activity_table_ext, cutoffs = c(1, total_log, distinct_viol))
+  
+  data.frame(
+    activity_cutoff = total_log,
+    violation_cutoff = distinct_viol,
+    users_retained = df_clean$users_retained,
+    obs_retained = df_clean$obs_retained
+  )
+}
+end <- Sys.time()
+print(end - start)
+
+df_retained <- bind_rows(df_retained)
+
+ptheme <- theme_minimal() +
+  theme(plot.title = element_text(size = 14, hjust = 0.50))
+
+pdf('figures/FigureEx1.pdf', width = 8, height = 7)
+p <- ggplot(
+  df_retained %>% filter(activity_cutoff != 0),
+  aes(x = activity_cutoff, y = (violation_cutoff),
+      fill = users_retained, label = paste0(users_retained, ' / ', obs_retained))
+) +
+  geom_raster() +
+  geom_text() +
+  ylab('Number of distinct actions violated (less than or equal)') +
+  xlab('Number of weeks with activity (at least)') +
+  scale_x_continuous(breaks = seq(1, 10, 1)) +
+  scale_y_continuous(breaks = seq(0, 10, 1)) +
+  scale_fill_gradientn(colors = brewer.pal(9, 'RdYlBu')) +
+  ptheme +
+  guides(fill = guide_legend(title = 'Percent retained')) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = 'top',
+    axis.text.y = element_text(margin = margin(r = -20), size = 10),
+    axis.text.x = element_text(margin = margin(t = -20), size = 10),
+    legend.margin = margin(b = -20, unit = 'pt')
+  )
+dev.off()
+p
+```
+
+## Extended Data Figure 2: Sensitivity analysis
+We run a sensitivity analysis for the Bayesian analysis.
+
+```{r}
+get_cf_bf <- function(form, df, prior_width) {
+  fit <- regressionBF(form, data = df, rscaleCont = prior_width, progress = FALSE)
+  comp <- fit[2] / fit[3]
+  comp@bayesFactor[1, 1]
+}
+
+get_sensitivity <- function(form, df, prior_widths) {
+  sapply(prior_widths, function(width) get_cf_bf(form, df, width))
+}
+
+prior_widths <- seq(0.01, 1, 0.01)
+sens_all <- get_sensitivity(emissions_log ~ n_act_log + days_on_app, df_emissions, prior_widths)
+sens_mob <- get_sensitivity(Transport_log ~ n_act_log + days_on_app, df_mob, prior_widths)
+sens_food <- get_sensitivity(Diet_log ~ n_act_log + days_on_app, df_food, prior_widths)
+sens_lifestyle <- get_sensitivity(Lifestyle_log ~ n_act_log + days_on_app, df_lifestyle, prior_widths)
+
+df_sens <- data.frame(
+  type = rep(c('Overall', 'Mobility', 'Purchase', 'Food'), each = length(prior_widths)),
+  prior_widths = prior_widths,
+  bfs = c(sens_all, sens_mob, sens_lifestyle, sens_food)
+) %>% 
+  mutate(
+    bfs = ifelse(type == 'Food', -bfs, bfs),
+    type = factor(type, levels = c('Overall', 'Mobility', 'Purchase', 'Food'))
+  )
+
+cols <- c('gray56', '#D95F02', '#7570B3', '#1B9E77')
+psens1 <- ggplot(df_sens, aes(x = prior_widths, y = bfs, col = type)) +
+  geom_line(linewidth = 1.5) +
+  scale_y_continuous(breaks = seq(0, 26, 2)) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_color_manual(name = '', values = cols) +
+  theme_minimal() +
+  labs(
+    y = 'Log Bayes factor',
+    x = 'Cauchy prior scale',
+  ) +
+  theme(
+    legend.position = 'top',
+    plot.title = element_text(size = 14, hjust = 0.50)
+  )
+```
+
+```{r, fig.width = 8, fig.height = 4}
+sens_identity <- c(
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_identity %>% filter(category == 'Mobility')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_identity %>% filter(category == 'Purchase')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_identity %>% filter(category == 'Food')), prior_widths
+  )
+)
+
+sens_effectiveness <- c(
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_effectiveness %>% filter(category == 'Mobility')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_effectiveness %>% filter(category == 'Purchase')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_effectiveness %>% filter(category == 'Food')), prior_widths
+  )
+)
+
+sens_concern <- c(
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_concern %>% filter(category == 'Mobility')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_concern %>% filter(category == 'Purchase')), prior_widths
+  ),
+  get_sensitivity(
+    log_n ~ value + days_on_app,
+    data.frame(df_concern %>% filter(category == 'Food')), prior_widths
+  )
+)
+
+df_sens2 <- data.frame(
+  type = rep(
+    c(
+      'Environmentalist identity',
+      'Perceived effectiveness',
+      'Climate concern'
+    ), each = length(prior_widths) * 3
+  ),
+  category = rep(c('Mobility', 'Purchase', 'Food'), each = length(prior_widths)),
+  prior_widths = prior_widths,
+  bfs = c(sens_identity, sens_effectiveness, sens_concern)
+) %>% 
+  mutate(
+    type = factor(
+      type,
+      levels = c(
+      'Environmentalist identity',
+      'Perceived effectiveness',
+      'Climate concern'
+      )
+    ),
+    category = factor(category, levels = c('Mobility', 'Purchase', 'Food'))
+  )
+
+cols <- cols[-1]
+psens2 <- ggplot(df_sens2, aes(x = prior_widths, y = bfs, color = category, linetype = type)) +
+  geom_line(linewidth = 1.5) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_y_continuous(breaks = seq(0, 2.5, 0.5), limits = c(0, 2.5)) +
+  scale_color_manual(name = '', values = cols) +
+  scale_linetype_manual(name = '', values = c(1, 3, 4)) +
+  theme_minimal() +
+  labs(
+    y = 'Log Bayes factor',
+    x = 'Cauchy prior scale',
+  ) +
+  theme(
+    legend.position = 'top',
+    # legend.box = 'vertical',
+    legend.key.width = unit(2, 'line'),
+    plot.title = element_text(size = 14, hjust = 0.50)
+  ) +
+  guides(color = FALSE)
+
+pdf('figures/FigureEx2.pdf', width = 12, height = 5)
+grid.arrange(psens1, psens2, ncol = 2)
+dev.off()
+grid.arrange(psens1, psens2, ncol = 2)
+```
+
+# Supplementary Figures
+## Figure S1: Number of actions logged
+```{r}
+df_agg <- distinct(df_clean, sub, .keep_all = TRUE) %>% 
+  select(nr_act, distinct_habits, total_weeks_active)
+
+p <- ggplot(df_agg, aes(x = distinct_habits, y = total_weeks_active, size = nr_act)) +
+  geom_point(color = col_all) +
+  labs(
+    x = 'Number of distinct actions',
+    y = 'Total weeks active',
+    size = 'Number of actions',
+    title = ''
+  ) +
+  scale_y_continuous(breaks = seq(0, 80, 10), limits = c(0, 80)) +
+  scale_x_continuous(breaks = seq(0, 140, 10), limits = c(0, 140)) +
+  theme_minimal() +
+  theme(
+    legend.position = 'top',
+    legend.title = element_text(),
+    plot.title = element_text(hjust = 0.50, size = 16)
+  )
+
+ggsave('figures/FigureS1.pdf', ggMarginal(p, type = 'histogram', fill = col_all), width = 9, height = 8)
+ggMarginal(p, type = 'histogram', fill = col_all)
+```
+
+Some descriptives.
+
+```{r}
+round(apply(df_agg, 2, mean), 2)
+round(apply(df_agg, 2, sd), 2)
+round(apply(df_agg, 2, median), 2)
+```
+
+## Figure S2: Users across country
+```{r}
+library(countrycode)
+
+df_country <- df_act_clean %>% 
+  distinct(sub, .keep_all = TRUE) %>% 
+  group_by(country) %>% 
+  summarize(n_country = n()) %>% 
+  arrange(desc(n_country))
+  
+country_names <- countrycode::countrycode(df_country$country, origin = 'iso2c', destination = 'country.name')
+
+p_country <- ggplot(df_country[seq(10), ], aes(x = reorder(country, -n_country), y = n_country)) +
+  geom_bar(stat = 'identity', fill = 'grey56') +
+  xlab('') +
+  ylab('Frequency') +
+  # ggtitle('Users across country') +
+  scale_y_continuous(breaks = seq(0, 2500, 500)) +
+  scale_x_discrete(
+    guide = guide_axis(angle = 0),
+    labels = country_names[seq(10)]
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = 'none',
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(hjust = 0.50, size = 16),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+ggsave('figures/FigureS2.pdf', p_country, width = 8, height = 6)
+p_country
+```
+
+```{r}
+# Some statistics
+nrow(df_country)
+sum(df_country$n_country <= 10)
+sum(df_country$n_country >= 50)
+```
+
+## Figure S4: Time-series of actions and carbon footprint
+```{r}
+df_act_timeline <- df_act_clean %>%
+  group_by(logged_habit) %>% 
+  summarize(n_act = n()) %>% 
+  rename(date = logged_habit)
+
+df_footprint_timeline <- df_info %>% 
+  group_by(footprint_date) %>% 
+  summarize(n_foot = n()) %>% 
+  rename(date = footprint_date)
+
+df_timeline <- df_act_timeline %>% 
+  left_join(df_footprint_timeline, by = 'date') %>% 
+  replace_na(list(n_foot = 0)) %>% 
+  pivot_longer(-date) %>% 
+  mutate(
+    name = ifelse(name == 'n_act', 'Actions', 'Carbon footprint')
+  )
+
+p_timeline <- ggplot(df_timeline, aes(x = date, y = value)) +
+  geom_bar(stat = 'identity', fill = col_all) +
+  scale_x_date(
+    date_breaks = '1 month',
+    date_labels = '%b %Y'
+  ) +
+  labs(
+    y = 'Activity logged',
+    x = ''
+  ) +
+  facet_wrap(~ name, nrow = 2, scales = 'free') +
+  theme_minimal() +
+  theme(
+    legend.position = 'none',
+    plot.title = element_text(size = tsize, hjust = 0.50),
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 12)
+  )
+
+
+ggsave(
+  'figures/FigureS4.pdf',
+  p_timeline, width = 8, height = 8
+)
+p_timeline
+```
+
+## Figure S5: Actions for Low and high carbon footprint users
+We split the category-specific emissions into high (above median) and low (below median) and see what actions they log.
+
+```{r, fig.height = 10}
+get_median_prop <- function(df_info_spec, df_act_clean, df_weeks_user_active, df_country_week, category) {
+  
+  if (category == 'Food') {
+    varname <- 'Diet'
+  } else if (category == 'Mobility') {
+    varname <- 'Transport'
+  } else if (category == 'Purchase') {
+    varname <- 'Lifestyle'
+  }
+  
+  df_median <- df_info_spec %>%
+    filter(category == !!category, !is.na(footprint_date)) %>% 
+    mutate(
+      below_median = ifelse(!!sym(varname) <= median(!!sym(varname)), 'Below median', 'Above median')
+    ) %>% 
+    select(sub, below_median)
+  
+  df_freq_avg_median <- df_median %>% 
+    left_join(
+      df_country_week %>% 
+        filter(category == !!category) %>% 
+        
+        # Group by person and action, count number of actions
+        group_by(sub, habit_name) %>% 
+        summarize(nr_act = n()),
+        by = 'sub'
+    ) %>% 
+    left_join(df_weeks_user_active, by = 'sub') %>% 
+    
+    # Calculate mean number of action per week
+    mutate(n_per_week = nr_act / nr_weeks_active) %>% 
+    
+    # Group by being below or above the median and the action name
+    group_by(below_median, habit_name) %>% 
+    summarize(
+      n_per_week_avg = mean(n_per_week),
+      sd_per_week_avg = sd(n_per_week),
+      se_per_week_avg = sd(n_per_week) / sqrt(n()),
+      ci_lo = n_per_week_avg - 1.96 * se_per_week_avg,
+      ci_hi = n_per_week_avg + 1.96 * se_per_week_avg
+    ) %>% 
+    mutate(category = !!category) %>% 
+    filter(habit_name != 'Scegli capi con fibre naturali') # has only 1 observation for below median
+
+  df_freq_avg_median
+}
+
+df_median_props <- bind_rows(
+  get_median_prop(df_info_spec, df_act_clean, df_weeks_user_active, df_country_week, 'Food'),
+  get_median_prop(df_info_spec, df_act_clean, df_weeks_user_active, df_country_week, 'Mobility'),
+  get_median_prop(df_info_spec, df_act_clean, df_weeks_user_active, df_country_week, 'Purchase')
+) %>% 
+  mutate(
+    category = factor(category, levels = c('Food', 'Mobility', 'Purchase'))
+  ) %>% 
+  arrange(category, n_per_week_avg) %>% 
+  mutate(
+    habit_name = factor(habit_name, levels = unique(habit_name)),
+    below_median = factor(below_median, levels = c('Below median', 'Above median'))
+  ) %>% 
+  rename(prop = n_per_week_avg)
+
+cols <- c("#4e79a7", "#f28e2b")
+p_median_actions <- ggplot(df_median_props, aes(x = habit_name, y = prop, fill = below_median)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_point(
+    aes(x = habit_name, y = prop), position = position_dodge(width = 0.80),
+    size = 1.5, show.legend = FALSE, color = 'black'
+  ) +
+  geom_errorbar(
+    aes(ymin = ci_lo, ymax = ci_hi), position = position_dodge(width = 0.80),
+    width = 0.60, linewidth = 1, show.legend = FALSE, color = 'black'
+  ) +
+  geom_point(
+    aes(x = habit_name, y = prop, col = below_median), position = position_dodge(width = 0.80),
+    size = 1, show.legend = FALSE
+  ) +
+  geom_errorbar(
+    aes(ymin = ci_lo, ymax = ci_hi, col = below_median), position = position_dodge(width = 0.80),
+    width = 0.50, linewidth = 0.50,
+    show.legend = FALSE
+  ) +
+  facet_wrap(~ category, scales = 'free_y', nrow = 3) +
+  theme_minimal() +
+  labs(
+    x = '', y = 'Mean number of actions per week',
+    title = ''
+  ) +
+  scale_fill_manual(values = cols) +
+  scale_color_manual(values = cols) +
+  coord_flip() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = 'top',
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.50)
+  )
+
+ggsave('figures/FigureS5.pdf', p_median_actions, width = 10, height = 14)
+p_median_actions
+```
+
+## Figure S6: Survey descriptives
+```{r}
+df_pol <- df_match %>% 
+  select(status, politics, n) %>%
+  pivot_longer(cols = c(status, politics), names_to = 'name', values_to = 'value') %>% 
+  mutate(
+    name = case_when(
+      name == 'status' ~ 'Perceived social status',
+      name == 'politics' ~ 'Political orientation'
+    ),
+    name = factor(
+      name,
+      levels = c(
+        'Perceived social status',
+        'Political orientation'
+      )
+    )
+  )
+
+df_match_cf <- df_fin %>% 
+  select(sub, language, gender, age, residence, environmentalist, efficacy, status, politics, inner_circle) %>% 
+  inner_join(df_info, by = 'sub') %>% 
+  filter(sub %in% unique(df_clean$sub)) %>% 
+  ungroup() %>% 
+  select(-sha)
+
+df_psych_cf <- df_match_cf %>% 
+  select(sub, environmentalist, efficacy, inner_circle, emissions) %>% 
+  pivot_longer(cols = -c(emissions, sub)) %>% 
+  mutate(
+    emissions_log = log(emissions, base = 2),
+    name = case_when(
+      name == 'efficacy' ~ 'Perceived effectiveness of individual action',
+      name == 'environmentalist' ~ 'Environmentalist identity',
+      name == 'inner_circle' ~ 'Climate concern in inner circle'
+    ),
+    name = factor(
+      name,
+      levels = c(
+        'Environmentalist identity',
+        'Perceived effectiveness of individual action',
+        'Climate concern in inner circle'
+      )
+    )
+  ) %>% 
+  left_join(df_info_spec %>% select(sub, days_on_app) %>% distinct, by = c('sub'))
+
+df_pol_cf <- df_match_cf %>% 
+  select(status, politics, emissions) %>%
+  pivot_longer(cols = c(status, politics), names_to = 'name', values_to = 'value') %>% 
+  mutate(
+    name = case_when(
+      name == 'status' ~ 'Perceived social status',
+      name == 'politics' ~ 'Political orientation'
+    ),
+    name = factor(
+      name,
+      levels = c(
+        'Perceived social status',
+        'Political orientation'
+      )
+    )
+  )
+```
+
+```{r}
+df_descr <- df_fin %>%
+  ungroup() %>% 
+  select(status, politics, environmentalist, efficacy) %>% 
+  pivot_longer(everything())
+
+df_descr$name <- factor(df_descr$name, levels = c('environmentalist', 'status', 'efficacy', 'politics'))
+
+ptheme <- theme_minimal() +
+  theme(plot.title = element_text(size = 14, hjust = 0.50))
+
+pstatus <- ggplot(df_fin, aes(x = status)) +
+  geom_bar(fill = col_all) +
+  xlab('') +
+  ylab('') +
+  ggtitle('Perceived status') +
+  scale_x_continuous(
+    labels = seq(1, 10), breaks = seq(1, 10), limits = c(0, 11)
+  ) +
+  ptheme
+
+ppolitics <- ggplot(df_fin, aes(x = politics)) +
+  geom_bar(fill = col_all) +
+  xlab('') +
+  ylab('') +
+  ggtitle('Political orientation') +
+  scale_x_continuous(
+    labels = seq(1, 7), breaks = seq(1, 7), limits = c(0, 8)
+  ) +
+  ptheme
+
+penv <- ggplot(df_fin, aes(x = environmentalist)) +
+  geom_bar(fill = col_all) +
+  xlab('') +
+  ylab('Frequency') +
+  coord_cartesian(ylim = c(0, 120)) +
+  ggtitle('Environmentalist identity') +
+  scale_x_continuous(
+    labels = seq(1, 7), breaks = seq(1, 7), limits = c(0, 8)
+  ) +
+  ptheme
+
+peff <- ggplot(df_fin, aes(x = efficacy)) +
+  geom_bar(fill = col_all) +
+  xlab('') +
+  ylab('Frequency') +
+  coord_cartesian(ylim = c(0, 120)) +
+  ggtitle('Perceived effectiveness of individual action') +
+  scale_x_continuous(
+    labels = seq(1, 7), breaks = seq(1, 7), limits = c(0, 8)
+  ) +
+  ptheme
+
+pdf('figures/FigureS6.pdf', width = 9, height = 8)
+pdescr <- grid.arrange(
+  penv, pstatus, peff, ppolitics, nrow = 2, ncol = 2
+)
+dev.off()
+pdescr <- grid.arrange(
+  penv, pstatus, peff, ppolitics, nrow = 2, ncol = 2
+)
+```
+
+## Figure S7: Carbon footprint
+```{r}
+ppsych_cf <- ggplot(df_psych_cf, aes(x = value, y = emissions), color = col_all) +
+  geom_jitter(width = 0.20, alpha = 0.50) +
+  scale_y_continuous(
+    name = 'Carbon footprint (kgCO2)',
+    labels = label_number(big.mark = ','),
+    trans = 'log10', breaks = c(1000, 2500, 5000, 10000, 25000, 50000, 100000)
+  ) +
+  scale_x_continuous(name = '', breaks = seq(1, 7)) +
+  facet_wrap(~ name) +
+  theme_minimal()
+```
+
+We run the relevant models.
+
+```{r, fig.height = 4, fig.width = 8}
+df_identity_cf <- df_psych_cf %>% filter(name == 'Environmentalist identity')
+df_effectiveness_cf <- df_psych_cf %>% filter(name == 'Perceived effectiveness of individual action')
+df_concern_cf <- df_psych_cf %>% filter(name == 'Climate concern in inner circle')
+
+fit_identity_cf <- lmBF(emissions_log ~ value, data = df_identity_cf)
+fit_effectiveness_cf <- lmBF(emissions_log ~ value, data = df_effectiveness_cf)
+fit_concern_cf <- lmBF(emissions_log ~ value, data = df_concern_cf)
+
+preds_identity_cf <- get_post_pred2(
+  fit_identity_cf, df_identity_cf, category = NULL, varname = 'value'
+)
+preds_effectiveness_cf <- get_post_pred2(
+  fit_effectiveness_cf, df_effectiveness_cf, category = NULL, varname = 'value'
+)
+preds_concern_cf <- get_post_pred2(
+  fit_concern_cf, df_concern_cf, category = NULL, varname = 'value'
+)
+
+preds_cf <- bind_rows(
+  preds_identity_cf %>% mutate(name = 'Environmentalist identity'),
+  preds_effectiveness_cf %>% mutate(name = 'Perceived effectiveness of individual action'),
+  preds_concern_cf %>% mutate(name = 'Climate concern in inner circle')
+) %>% 
+  mutate(
+    name = factor(
+      name,
+      levels = c(
+        'Environmentalist identity',
+        'Perceived effectiveness of individual action',
+        'Climate concern in inner circle'
+      )
+    )
+  )
+
+ppsych_cf_reg <- ppsych_cf +
+  geom_ribbon(data = preds_cf, aes(x = values, y = 2^preds_mean, ymin = 2^ci_lo, ymax = 2^ci_hi), alpha = 0.2) +
+  geom_line(data = preds_cf, aes(y = 2^preds_mean, x = values), size = 1) +
+  guides(fill = FALSE, color = FALSE) +
+  theme(
+    strip.text = element_text(size = 10)
+  )
+
+ggsave('figures/FigureS7.pdf', ppsych_cf_reg, width = 10, height = 4)
+ppsych_cf_reg
+```

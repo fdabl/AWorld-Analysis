@@ -1,0 +1,2 @@
+# AWorld Analysis
+This repository contains code to reproduce all analyses and figures for the paper Dablander, F., Nielsen, K.S., Bauer, J.M., Basconi, L., & Brick, C. ([2025](https://osf.io/preprints/psyarxiv/4dx8q)). Personal climate actions in a popular smartphone app. We cannot share the data itself for privacy reasons.
